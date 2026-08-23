@@ -59,3 +59,29 @@ A transcript is expensive to produce and impossible to recreate — you have alr
 said the words. So every optional stage degrades rather than fails: if Ollama is
 down, you get the raw transcript; if cleanup times out, you get the raw transcript.
 The only unrecoverable failure is not capturing audio at all.
+
+## Measured performance
+
+MacBook Pro, Apple M5, 10 cores, 32 GB. 7.4 s of speech. Higher is better.
+
+| Model | Compute | Threads | Speed |
+|---|---|---|---|
+| large-v3-turbo | int8 | 4 | 1.6x realtime |
+| large-v3-turbo | int8 | 10 | 2.1x realtime |
+| **large-v3-turbo** | **float32** | **10** | **2.7x realtime** |
+| distil-large-v3 | int8 | 10 | 2.6x realtime |
+| small | int8 | 10 | 4.2x realtime |
+| base | int8 | 10 | 9.0x realtime |
+
+Two things worth remembering:
+
+**float32 beats int8 here.** CTranslate2's ARM float path is better optimised than
+its int8 path, so quantisation costs more than it saves. This is the opposite of the
+usual advice — measure before assuming.
+
+**CTranslate2 is CPU-only.** There is no Metal backend, so the GPU and Neural Engine
+sit idle. This is the real ceiling: a Parakeet/MLX pipeline would use that silicon
+and be substantially faster. That is the obvious next improvement if latency ever
+becomes annoying.
+
+At 2.7x realtime, a 15-second dictation takes about 5.5 seconds to appear.

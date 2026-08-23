@@ -118,14 +118,20 @@ class Transcriber:
         device = section.get("device", "auto")
         compute = section.get("compute_type", "auto")
 
+        threads = section.getint("cpu_threads", 0)
+
         if device == "auto":
             device = "cpu"          # CTranslate2 has no Metal backend; CPU is correct on Mac
         if compute == "auto":
-            compute = "int8"
+            # float32 measured faster than int8 on Apple Silicon - see config.ini
+            compute = "float32" if sys.platform == "darwin" else "int8"
 
-        print(f"Loading model '{model_name}' (device={device}, compute={compute})...")
+        print(f"Loading model '{model_name}' "
+              f"(device={device}, compute={compute}, threads={threads or 'auto'})...")
         t0 = time.time()
-        self.model = WhisperModel(model_name, device=device, compute_type=compute)
+        self.model = WhisperModel(
+            model_name, device=device, compute_type=compute, cpu_threads=threads
+        )
         print(f"Model ready in {time.time() - t0:.1f}s")
 
         self.language = section.get("language", "en")
