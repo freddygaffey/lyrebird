@@ -28,6 +28,7 @@ sys.path.insert(0, str(ROOT / "src"))
 import backends  # noqa: E402  (needs sys.path set above)
 import capture as capture_mod  # noqa: E402
 import cleanup as cleanup_mod  # noqa: E402
+import editguard as editguard_mod  # noqa: E402
 import streaming as streaming_mod  # noqa: E402
 import paths  # noqa: E402
 
@@ -239,6 +240,17 @@ def run_listener(cfg: configparser.ConfigParser) -> None:
 
     live = cfg["transcription"].getboolean("live", False)
     stream_holder: dict = {"st": None}
+    guard = None
+
+    if live and cfg["transcription"].getboolean("hold_while_editing", True):
+        guard = editguard_mod.EditGuard(
+            idle_seconds=cfg["transcription"].getfloat("edit_idle_seconds", 1.2),
+            on_flush=lambda t: emit_raw(t, cfg),
+            on_state=lambda held: _set_state("busy" if held else "listening"),
+        )
+        if not guard.start():
+            print("  (edit protection unavailable)", file=sys.stderr)
+            guard = None
 
     if live:
         def on_chunk(mono):
@@ -267,7 +279,10 @@ def run_listener(cfg: configparser.ConfigParser) -> None:
                 text = (" " if typed_any["v"] else "") + " ".join(words)
                 typed_any["v"] = True
                 try:
-                    emit_raw(text, cfg)
+                    if guard is not None:
+                        guard.submit(text)        # held back if you are editing
+                    else:
+                        emit_raw(text, cfg)
                 except Exception as exc:          # noqa: BLE001
                     print(f"  [live] could not type: {exc}", file=sys.stderr)
 
@@ -292,6 +307,8 @@ def run_listener(cfg: configparser.ConfigParser) -> None:
             recorder.stop()
             try:
                 text = st.finish() if st else ""
+                if guard is not None:
+                    guard.flush()                 # never lose held words
                 print(f"  live: {len(text.split())} words")
             finally:
                 _set_state("idle")
