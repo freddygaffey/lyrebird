@@ -127,6 +127,17 @@ class Transcriber:
 # -------------------------------------------------------------------------- cleanup
 _CLEANER = None
 
+# Set by app.py so the menu bar icon can reflect what the listener is doing.
+STATE_HOOK = None
+
+
+def _set_state(state: str) -> None:
+    if STATE_HOOK is not None:
+        try:
+            STATE_HOOK(state)
+        except Exception:                          # noqa: BLE001 - cosmetic only
+            pass
+
 
 def clean_text(text: str, cfg: configparser.ConfigParser) -> str:
     """Optional grammar pass. Loads the model once, on first use."""
@@ -246,6 +257,7 @@ def run_listener(cfg: configparser.ConfigParser) -> None:
             if state["recording"] or state["busy"]:
                 return
             state["recording"] = True
+        _set_state("listening")
         print("● recording — press again to stop" if mode == "toggle" else "● recording")
         if live:
             typed_any = {"v": False}
@@ -282,11 +294,13 @@ def run_listener(cfg: configparser.ConfigParser) -> None:
                 text = st.finish() if st else ""
                 print(f"  live: {len(text.split())} words")
             finally:
+                _set_state("idle")
                 stream_holder["st"] = None
                 with lock:
                     state["busy"] = False
             return
 
+        _set_state("busy")
         print("… transcribing")
         try:
             audio = recorder.stop()
@@ -302,6 +316,7 @@ def run_listener(cfg: configparser.ConfigParser) -> None:
             text = clean_text(text, cfg)
             emit(text, cfg)
         finally:
+            _set_state("idle")
             with lock:
                 state["busy"] = False
 
