@@ -1,0 +1,60 @@
+# Custom vocabulary — one term per line. Lines starting with # are ignored.
+#
+# These are fed to Whisper as an initial prompt, which biases it towards
+# recognising them. This is the single highest-value file in this repo:
+# it is what stops "servo" being transcribed as "server".
+#
+# Add any term you say often that is unusual, technical, or a proper noun.
+
+# --- 3D printing / CAD ---
+Onshape
+InDesign
+Prusa Slicer
+Bambu Lab
+PETG
+PLA
+TPU
+filament
+louvre
+louvres
+chamfer
+chamfered
+chamfering
+fillet
+brim
+infill
+extrude
+revolve
+perforations
+print-in-place
+elephant's foot
+overhang
+STL
+G-code
+slicer
+tolerance
+
+# --- Electronics ---
+ESP32
+ESP32C3
+MOSFET
+PWM
+SG90
+servo
+servo horn
+microcontroller
+solder
+soldering
+flux
+breadboard
+PCB
+18650
+threaded insert
+
+# --- Project specific ---
+L-plate
+P-plate
+MDP
+logbook
+NESA
+HSC
