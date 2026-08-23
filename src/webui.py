@@ -34,7 +34,24 @@ BACKUPS = paths.config_dir() / "backups"
 
 app = Flask(__name__)
 
-MODELS = ["tiny", "base", "small", "medium", "large-v3", "large-v3-turbo", "distil-large-v3"]
+# (value, friendly name, download size, what you gain, what it costs, show in simple mode)
+MODELS = [
+    ("tiny",            "Fastest",        "75 MB",  "Instant, runs on anything",
+     "Noticeably more mistakes. Fine for short notes, not for documents.", False),
+    ("base",            "Very fast",      "145 MB", "Quick, very light on memory",
+     "Struggles with technical words and accents.", False),
+    ("small",           "Balanced",       "480 MB", "Good accuracy, quick on any laptop",
+     "Misses some unusual or technical words.", True),
+    ("medium",          "More accurate",  "1.5 GB", "Handles accents and difficult audio well",
+     "Slower, and uses about 2 GB of memory.", False),
+    ("large-v3-turbo",  "Recommended",    "1.6 GB", "Best balance: near-top accuracy, still fast",
+     "Larger download. Needs roughly 2 GB of memory.", True),
+    ("large-v3",        "Most accurate",  "3 GB",   "The best accuracy available",
+     "About 5x slower than Recommended for a barely noticeable accuracy gain.", True),
+    ("distil-large-v3", "Distilled",      "1.5 GB", "Almost as accurate as Most accurate, much faster",
+     "English only.", False),
+]
+MODEL_VALUES = [m[0] for m in MODELS]
 KEYS = ["f5", "f6", "f7", "f8", "f13", "f14", "cmd_r", "alt_r", "ctrl_r"]
 BACKENDS = [("auto", "Automatic - pick the fastest available"),
             ("mlx", "Apple GPU (Metal) - fastest on a Mac"),
@@ -116,6 +133,7 @@ TEMPLATE = """
  :root{--bg:#fbfbfd;--fg:#1d1d1f;--mut:#6e6e73;--line:#d2d2d7;--acc:#0071e3;--card:#fff}
  @media(prefers-color-scheme:dark){:root{--bg:#161618;--fg:#f5f5f7;--mut:#98989d;--line:#38383c;--card:#1f1f22}}
  *{box-sizing:border-box}
+ body:not([data-mode]) .expert-only{display:none}
  body{margin:0;padding:2rem 1rem 4rem;background:var(--bg);color:var(--fg);
       font:16px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
  .wrap{max-width:760px;margin:0 auto}
@@ -149,17 +167,46 @@ TEMPLATE = """
  .bench th{text-align:left;color:var(--mut);font-weight:600;border-bottom:1px solid var(--line);padding:.35rem 0}
  .bench td{padding:.35rem .5rem .35rem 0}
  .win{font-weight:700;color:#1a7f37}
+ .choices{display:flex;flex-direction:column;gap:.6rem}
+ .choice{display:flex;gap:.7rem;align-items:flex-start;margin:0;padding:.75rem .85rem;
+         border:1px solid var(--line);border-radius:10px;cursor:pointer;font-weight:400}
+ .choice:hover{border-color:var(--acc)}
+ .choice:has(input:checked){border-color:var(--acc);box-shadow:inset 0 0 0 1px var(--acc)}
+ .choice input{margin-top:.28rem;flex:none}
+ .choice-body{display:flex;flex-direction:column;gap:.15rem}
+ .choice-head{display:flex;align-items:center;gap:.5rem;flex-wrap:wrap}
+ .tag{font-size:.75rem;color:var(--mut);border:1px solid var(--line);
+      border-radius:999px;padding:.05rem .45rem}
+ .tag.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+ .gain{font-size:.87rem}
+ .cost{font-size:.82rem;color:var(--mut)}
+ .warn{font-size:.87rem;background:rgba(201,123,60,.12);border:1px solid rgba(201,123,60,.4);
+       border-radius:8px;padding:.6rem .8rem;margin:.6rem 0 1rem}
+ .head{display:flex;justify-content:space-between;align-items:flex-start;gap:1rem;flex-wrap:wrap;margin-bottom:2rem}
+ .modes{display:inline-flex;border:1px solid var(--line);border-radius:999px;padding:3px;background:var(--card)}
+ .mode{background:transparent;color:var(--mut);border:0;border-radius:999px;
+       padding:.4rem 1rem;font:inherit;font-size:.85rem;font-weight:600;cursor:pointer}
+ .mode.on{background:var(--acc);color:#fff}
+ body[data-mode="simple"] .expert-only{display:none}
  .spin{display:inline-block;width:.8em;height:.8em;border:2px solid var(--line);
        border-top-color:var(--acc);border-radius:50%;animation:sp .7s linear infinite;vertical-align:-1px}
  @keyframes sp{to{transform:rotate(360deg)}}
 </style>
-<div class="wrap">
-<h1>Dictation Settings</h1>
-<p class="sub">Changes are saved to your config files. Restart dictation to apply them.</p>
+<div class="wrap" id="top">
+<div class="head">
+  <div>
+    <h1>Lyrebird</h1>
+    <p class="sub">Changes save straight away. Restart Lyrebird to apply them.</p>
+  </div>
+  <div class="modes" role="group" aria-label="Detail level">
+    <button type="button" class="mode on" data-mode="simple" onclick="setMode('simple')">Simple</button>
+    <button type="button" class="mode" data-mode="expert" onclick="setMode('expert')">Expert</button>
+  </div>
+</div>
 
 {% if saved %}<div class="saved">Saved. Restart the dictation program for changes to take effect.</div>{% endif %}
 
-<div class="card">
+<div class="card expert-only">
   <h2>Status</h2>
   <p class="hint">A quick health check of the parts that have to work.</p>
   <table>
@@ -172,7 +219,8 @@ TEMPLATE = """
 <form method="post" action="{{ url_for('save') }}">
 <div class="card">
   <h2>How you start dictating</h2>
-  <p class="hint">Pick the key you press to begin talking.</p>
+  <p class="hint">Pick the key you press to begin talking.<br>
+  <b>Press once to start and stop</b> suits long dictation &mdash; you are not holding a key down for minutes. <b>Hold while talking</b> suits short bursts and makes it impossible to leave the microphone on by accident.</p>
   <div class="row">
     <div><label>Key<select name="hotkey_key">
       {% for k in keys %}<option value="{{k}}" {{ 'selected' if cfg['hotkey']['key']==k }}>{{k.upper()}}</option>{% endfor %}
@@ -184,7 +232,7 @@ TEMPLATE = """
   </div>
 </div>
 
-<div class="card">
+<div class="card expert-only">
   <h2>Engine</h2>
   <p class="hint">Which hardware does the work. <b>Automatic</b> is right for almost everyone &mdash; on this Mac it selects the Apple GPU, which measured about 6&times; faster than the CPU.</p>
   <label>Engine<select name="backend">
@@ -202,7 +250,7 @@ TEMPLATE = """
   </div>
 </div>
 
-<div class="card">
+<div class="card expert-only">
   <h2>Find the best settings automatically</h2>
   <p class="hint">Tries every engine and model available on this computer and measures both <b>speed</b> and <b>mistakes</b>. The fastest option is not always the best, so results are ranked by accuracy first. First run downloads models and can take several minutes.</p>
   <div style="display:flex;gap:.75rem;align-items:center;flex-wrap:wrap">
@@ -214,12 +262,34 @@ TEMPLATE = """
 </div>
 
 <div class="card">
+  <h2>Live typing</h2>
+  <p class="hint">Show words as you speak, instead of waiting until you stop &mdash; the way Apple's dictation behaves.<br>
+  <b>What it costs:</b> the speech engine runs continuously rather than once, so it uses noticeably more processor. Words appear about a second and a half behind your voice. Nothing you see is ever rewritten &mdash; text only appears once the engine is sure of it.</p>
+  <div class="check">
+    <input type="checkbox" id="lv" name="live" {{ 'checked' if cfg['transcription'].getboolean('live', False) }}>
+    <label for="lv">Type words as I speak <span class="fh">Turn off on an older or battery-powered machine.</span></label>
+  </div>
+  <label class="expert-only">Update interval <span class="fh">Seconds between passes. Lower feels more immediate but costs more processor.</span>
+    <input type="number" step="0.1" min="0.5" max="5" name="live_interval" value="{{ cfg['transcription'].get('live_interval','1.4') }}"></label>
+</div>
+
+<div class="card">
   <h2>Accuracy</h2>
-  <p class="hint">Bigger models are more accurate but slower. <code>large-v3-turbo</code> is the best balance on an Apple Silicon Mac.</p>
-  <label>Speech model<select name="model">
-    {% for m in models %}<option value="{{m}}" {{ 'selected' if cfg['transcription']['model']==m }}>{{m}}</option>{% endfor %}
-  </select></label>
-  <label>Language <span class="fh">Use <code>en</code> for English. <code>auto</code> is slower and less accurate.</span>
+  <p class="hint">Every model is a trade between accuracy, speed and download size. There is no best one &mdash; only the right one for your machine and your work. Each option below states what it costs you, not just what it gives you.</p>
+  <div class="choices">
+    {% for value, name, size, gain, cost, simple in models %}
+    <label class="choice {{ '' if simple else 'expert-only' }}">
+      <input type="radio" name="model" value="{{value}}" {{ 'checked' if cfg['transcription']['model']==value }}>
+      <span class="choice-body">
+        <span class="choice-head"><b>{{ name }}</b><span class="tag">{{ size }}</span>
+          <span class="tag mono expert-only">{{ value }}</span></span>
+        <span class="gain">{{ gain }}</span>
+        <span class="cost">Trade-off: {{ cost }}</span>
+      </span>
+    </label>
+    {% endfor %}
+  </div>
+  <label class="expert-only">Language <span class="fh">Use <code>en</code> for English. <code>auto</code> is slower and less accurate.</span>
     <input type="text" name="language" value="{{ cfg['transcription']['language'] }}"></label>
   <div class="check">
     <input type="checkbox" id="ud" name="use_dictionary" {{ 'checked' if cfg['transcription'].getboolean('use_dictionary') }}>
@@ -229,12 +299,14 @@ TEMPLATE = """
 
 <div class="card">
   <h2>Grammar cleanup</h2>
-  <p class="hint">Optionally tidy grammar and remove "um" and "uh" using a second AI model that also runs on this computer. Adds a few seconds before the text appears.</p>
+  <p class="hint">Tidies grammar and removes "um" and "uh" using a second AI model, also running on this computer.<br>
+  <b>What it costs:</b> a few seconds before your text appears, a one-off 1 GB download, and a small risk the model rewords something slightly. Leave it off if you want your words exactly as spoken.</p>
   <div class="check">
     <input type="checkbox" id="ce" name="cleanup_enabled" {{ 'checked' if cfg['cleanup'].getboolean('enabled') }}>
     <label for="ce">Turn on grammar cleanup <span class="fh">Requires Ollama to be installed and running.</span></label>
   </div>
-  <label>Cleanup model<input type="text" name="cleanup_model" value="{{ cfg['cleanup']['model'] }}"></label>
+  <label class="expert-only">Cleanup model <span class="fh">Leave blank for the built-in default.</span>
+    <input type="text" name="cleanup_model" value="{{ cfg['cleanup']['model'] }}"></label>
 </div>
 
 <div class="card">
@@ -244,16 +316,24 @@ TEMPLATE = """
       <option value="type" {{ 'selected' if cfg['output']['method']=='type' }}>Type it out (works everywhere)</option>
       <option value="clipboard" {{ 'selected' if cfg['output']['method']=='clipboard' }}>Paste it (faster for long text)</option>
     </select></label></div>
-    <div><label>Pause before typing <span class="fh">seconds, to refocus a window</span>
+    <div class="expert-only"><label>Pause before typing <span class="fh">seconds, to refocus a window</span>
       <input type="number" step="0.05" min="0" max="5" name="delay_before_type" value="{{ cfg['output'].get('delay_before_type','0.15') }}"></label></div>
-    <div><label>Max recording <span class="fh">seconds, safety net</span>
+    <div class="expert-only"><label>Max recording <span class="fh">seconds, safety net</span>
       <input type="number" min="10" max="3600" name="max_seconds" value="{{ cfg['audio'].get('max_seconds','300') }}"></label></div>
   </div>
 </div>
 
 <div class="card">
   <h2>My word list</h2>
-  <p class="hint">One word or phrase per line. Add anything unusual you say often — technical terms, product names, people's names. Lines starting with <code>#</code> are notes and are ignored.</p>
+  <p class="hint">One word or phrase per line. Add anything unusual you say often — technical terms, product names, people's names. Lines starting with <code>#</code> are notes and are ignored.<br>
+  <b>This is the single most effective setting here.</b> It is what stops “servo” being written as “server”, and it costs nothing in speed.</p>
+  {% if dict_used > dict_limit %}
+  <p class="warn"><b>Your list is too long.</b> It needs about {{ dict_used }} of the {{ dict_limit }} the speech engine accepts, so words near the bottom are being ignored. Remove the ones you rarely say.</p>
+  {% elif dict_used > dict_limit * 0.8 %}
+  <p class="warn"><b>Nearly full.</b> About {{ dict_used }} of {{ dict_limit }} used. Once it is full, extra words are ignored silently rather than flagged.</p>
+  {% else %}
+  <p class="hint" style="margin:.4rem 0 1rem">{{ dict_terms }} terms, using about {{ dict_used }} of {{ dict_limit }} — room for roughly {{ ((dict_limit - dict_used) / 2.4) | int }} more.</p>
+  {% endif %}
   <textarea name="dictionary" spellcheck="false">{{ dictionary }}</textarea>
 </div>
 
@@ -261,6 +341,18 @@ TEMPLATE = """
 </form>
 </div>
 <script>
+function setMode(m){
+  document.body.setAttribute('data-mode', m);
+  document.querySelectorAll('.mode').forEach(function(b){
+    b.classList.toggle('on', b.dataset.mode === m);
+  });
+  try { localStorage.setItem('lyrebird-mode', m); } catch(e) {}
+}
+(function(){
+  var m = 'simple';
+  try { m = localStorage.getItem('lyrebird-mode') || 'simple'; } catch(e) {}
+  setMode(m);
+})();
 function startBench(quick){
   document.getElementById('benchBtn').disabled = true;
   document.getElementById('benchMsg').innerHTML = '<span class="spin"></span> running — this can take several minutes';
@@ -348,12 +440,17 @@ def benchmark_apply():
 
 @app.get("/")
 def index():
+    n_terms, used, limit = backends.dictionary_budget()
     return render_template_string(
         TEMPLATE,
         cfg=read_config(),
+        dict_terms=n_terms,
+        dict_used=used,
+        dict_limit=limit,
         dictionary=DICTIONARY.read_text(encoding="utf-8") if DICTIONARY.exists() else "",
         diags=diagnostics(),
         models=MODELS,
+        model_values=MODEL_VALUES,
         keys=KEYS,
         bkends=BACKENDS,
         devs=DEVICES,
@@ -377,6 +474,8 @@ def save():
     cfg["transcription"]["device"] = f.get("device", "auto")
     cfg["transcription"]["compute_type"] = f.get("compute_type", "auto")
     cfg["transcription"]["cpu_threads"] = f.get("cpu_threads", "0").strip() or "0"
+    cfg["transcription"]["live"] = str("live" in f).lower()
+    cfg["transcription"]["live_interval"] = f.get("live_interval", "1.4").strip() or "1.4"
     cfg["output"]["delay_before_type"] = f.get("delay_before_type", "0.15").strip() or "0.15"
     cfg["audio"]["max_seconds"] = f.get("max_seconds", "300").strip() or "300"
     cfg["cleanup"]["enabled"] = str("cleanup_enabled" in f).lower()

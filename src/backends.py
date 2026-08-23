@@ -12,6 +12,7 @@ Measured on an M5: MLX 16.7x realtime vs CPU 2.7x. Prefer MLX on a Mac.
 """
 from __future__ import annotations
 
+import os
 import platform
 import sys
 from pathlib import Path
@@ -37,15 +38,42 @@ def is_apple_silicon() -> bool:
     return sys.platform == "darwin" and platform.machine() == "arm64"
 
 
+MLX_IMPORT_ERROR: str | None = None
+
+
 def has_mlx() -> bool:
+    """True if the MLX backend can actually be used.
+
+    Records why it cannot, rather than swallowing it: a silent False here costs
+    a 5.5x speedup and gives no clue what went wrong.
+    """
+    global MLX_IMPORT_ERROR
+    if os.environ.get("LYREBIRD_NO_GPU") == "1":
+        MLX_IMPORT_ERROR = "disabled by LYREBIRD_NO_GPU"
+        return False
+    if not is_apple_silicon():
+        MLX_IMPORT_ERROR = "not Apple Silicon"
+        return False
     try:
         import mlx_whisper  # noqa: F401
-        return is_apple_silicon()
-    except Exception:
+        MLX_IMPORT_ERROR = None
+        return True
+    except Exception as exc:
+        import traceback
+        MLX_IMPORT_ERROR = f"{type(exc).__name__}: {exc}"
+        if os.environ.get("LYREBIRD_DEBUG"):
+            traceback.print_exc()
         return False
 
 
 def has_cuda() -> bool:
+    """Whether an NVIDIA GPU is usable.
+
+    LYREBIRD_NO_GPU=1 forces this off. On a shared machine the GPU may be busy
+    with someone else's work, and quietly taking it is not acceptable.
+    """
+    if os.environ.get("LYREBIRD_NO_GPU") == "1":
+        return False
     try:
         import ctranslate2
         return ctranslate2.get_cuda_device_count() > 0
@@ -70,7 +98,8 @@ def describe_hardware() -> list[tuple[str, str, bool]]:
         rows.append(("Apple Silicon", platform.processor() or "arm64", True))
         rows.append((
             "Metal GPU (MLX)",
-            "available — fastest option" if has_mlx() else "not installed (pip install mlx-whisper)",
+            "available — fastest option" if has_mlx()
+            else f"unavailable ({MLX_IMPORT_ERROR})",
             has_mlx(),
         ))
     cuda = has_cuda()
@@ -169,13 +198,30 @@ def build(backend: str, model: str, device: str = "auto",
     if backend == "mlx":
         if not has_mlx():
             raise RuntimeError(
-                "MLX backend requested but unavailable. "
-                "Needs Apple Silicon and `pip install mlx-whisper`."
+                "MLX backend requested but unavailable: "
+                f"{MLX_IMPORT_ERROR or 'unknown reason'}"
             )
         return MLXBackend(model)
     if backend == "ctranslate2":
         return CTranslate2Backend(model, device, compute_type, cpu_threads)
     raise ValueError(f"Unknown backend '{backend}' (expected auto, mlx or ctranslate2)")
+
+
+# Whisper accepts at most 224 tokens of initial_prompt. Anything beyond that is
+# silently dropped - no error, no warning, the terms just stop working. Since the
+# dictionary is the single most valuable setting, silent truncation is the worst
+# possible failure mode, so we measure it and say so.
+PROMPT_TOKEN_LIMIT = 224
+
+
+def dictionary_budget() -> tuple[int, int, int]:
+    """(terms, approx tokens used, limit)."""
+    prompt = load_dictionary()
+    if not prompt:
+        return 0, 0, PROMPT_TOKEN_LIMIT
+    terms = prompt.split(", ")
+    approx = int(len(prompt.split()) * 1.3) + len(terms)
+    return len(terms), approx, PROMPT_TOKEN_LIMIT
 
 
 def load_dictionary() -> str:

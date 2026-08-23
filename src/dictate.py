@@ -26,6 +26,8 @@ CONFIG_DIR = ROOT / "config"  # replaced at runtime by paths.config_dir()
 sys.path.insert(0, str(ROOT / "src"))
 
 import backends  # noqa: E402  (needs sys.path set above)
+import cleanup as cleanup_mod  # noqa: E402
+import streaming as streaming_mod  # noqa: E402
 import paths  # noqa: E402
 
 
@@ -57,7 +59,8 @@ def load_dictionary() -> str:
 class Recorder:
     """Buffers microphone input until stopped."""
 
-    def __init__(self, sample_rate: int, channels: int, max_seconds: int):
+    def __init__(self, sample_rate: int, channels: int, max_seconds: int,
+                 on_chunk=None):
         import numpy as np  # noqa: F401  (imported for side effect of early failure)
 
         self.sample_rate = sample_rate
@@ -66,18 +69,23 @@ class Recorder:
         self._frames: list = []
         self._stream = None
         self._started_at = 0.0
+        self.on_chunk = on_chunk
 
     def start(self) -> None:
         import sounddevice as sd
 
         self._frames = []
-        self._started_at = time.time()
+        self._started_at = time.monotonic()
 
         def callback(indata, frames, time_info, status):
             if status:
                 print(f"  audio status: {status}", file=sys.stderr)
-            self._frames.append(indata.copy())
-            if time.time() - self._started_at > self.max_seconds:
+            block = indata.copy()
+            self._frames.append(block)
+            if self.on_chunk is not None:
+                mono = block.mean(axis=1) if block.ndim > 1 else block
+                self.on_chunk(mono.astype("float32"))
+            if time.monotonic() - self._started_at > self.max_seconds:
                 raise sd.CallbackStop()
 
         self._stream = sd.InputStream(
@@ -115,7 +123,7 @@ class Transcriber:
 
         print(f"Loading '{model}' on {resolved} backend"
               f"{'' if requested == resolved else f' (auto-selected from {requested})'}...")
-        t0 = time.time()
+        t0 = time.monotonic()
         self.backend = backends.build(
             requested,
             model,
@@ -127,7 +135,7 @@ class Transcriber:
             self.backend.warm()
         except Exception as exc:            # noqa: BLE001 - warming is best-effort
             print(f"  (warm-up skipped: {exc})", file=sys.stderr)
-        print(f"Model ready in {time.time() - t0:.1f}s")
+        print(f"Model ready in {time.monotonic() - t0:.1f}s")
 
         self.language = section.get("language", "en")
         self.initial_prompt = (
@@ -139,47 +147,48 @@ class Transcriber:
 
 
 # -------------------------------------------------------------------------- cleanup
-def clean_with_ollama(text: str, cfg: configparser.ConfigParser) -> str:
-    """Optional local LLM pass. Returns the original text on any failure."""
-    import requests
+_CLEANER = None
+
+
+def clean_text(text: str, cfg: configparser.ConfigParser) -> str:
+    """Optional grammar pass. Loads the model once, on first use."""
+    global _CLEANER
 
     section = cfg["cleanup"]
     if not section.getboolean("enabled", False) or not text:
         return text
-
-    endpoint = section.get("endpoint", "http://localhost:11434").rstrip("/")
-    model = section.get("model", "llama3.1:8b")
-    timeout = section.getint("timeout_seconds", 30)
-    instruction = " ".join(section.get("prompt", "").split())
-
-    try:
-        resp = requests.post(
-            f"{endpoint}/api/generate",
-            json={
-                "model": model,
-                "prompt": f"{instruction}\n\nText:\n{text}",
-                "stream": False,
-                "options": {"temperature": 0},
-            },
-            timeout=timeout,
+    if _CLEANER is None:
+        engine = cleanup_mod.resolve(section.get("engine", "auto"),
+                                     section.get("endpoint", "http://localhost:11434"))
+        if engine == "none":
+            print("  cleanup enabled but no engine available — skipping", file=sys.stderr)
+            section["enabled"] = "false"
+            return text
+        print(f"  loading cleanup model ({engine})...")
+        _CLEANER = cleanup_mod.Cleaner(
+            engine=engine,
+            model=section.get("model", "").strip(),
+            endpoint=section.get("endpoint", "http://localhost:11434"),
+            timeout=section.getint("timeout_seconds", 60),
         )
-        resp.raise_for_status()
-        cleaned = resp.json().get("response", "").strip()
-        return cleaned or text
-    except Exception as exc:                      # noqa: BLE001 - never lose a transcript
-        print(f"  cleanup skipped ({exc.__class__.__name__}: {exc})", file=sys.stderr)
-        return text
+    return _CLEANER.clean(text)
 
 
 # --------------------------------------------------------------------------- output
 def emit(text: str, cfg: configparser.ConfigParser) -> None:
     if not text:
         return
-    section = cfg["output"]
-    if section.getboolean("echo_to_stdout", True):
+    if cfg["output"].getboolean("echo_to_stdout", True):
         print(f"> {text}")
+    time.sleep(cfg["output"].getfloat("delay_before_type", 0.15))
+    emit_raw(text, cfg)
 
-    time.sleep(section.getfloat("delay_before_type", 0.15))
+
+def emit_raw(text: str, cfg: configparser.ConfigParser) -> None:
+    """Send text to the focused field with no logging and no delay."""
+    if not text:
+        return
+    section = cfg["output"]
     method = section.get("method", "type")
 
     if method == "clipboard":
@@ -239,6 +248,16 @@ def run_listener(cfg: configparser.ConfigParser) -> None:
     )
     transcriber = Transcriber(cfg)
 
+    live = cfg["transcription"].getboolean("live", False)
+    stream_holder: dict = {"st": None}
+
+    if live:
+        def on_chunk(mono):
+            st = stream_holder["st"]
+            if st is not None:
+                st.add_audio(mono)
+        recorder.on_chunk = on_chunk
+
     hotkey = resolve_key(cfg["hotkey"].get("key", "f5"))
     mode = cfg["hotkey"].get("mode", "toggle").strip().lower()
     state = {"recording": False, "busy": False}
@@ -250,6 +269,26 @@ def run_listener(cfg: configparser.ConfigParser) -> None:
                 return
             state["recording"] = True
         print("● recording — press again to stop" if mode == "toggle" else "● recording")
+        if live:
+            typed_any = {"v": False}
+
+            def emit(words):
+                # Type as the words are confirmed, so text appears while talking.
+                text = (" " if typed_any["v"] else "") + " ".join(words)
+                typed_any["v"] = True
+                try:
+                    emit_raw(text, cfg)
+                except Exception as exc:          # noqa: BLE001
+                    print(f"  [live] could not type: {exc}", file=sys.stderr)
+
+            stream_holder["st"] = streaming_mod.StreamingTranscriber(
+                transcriber.backend,
+                transcriber.language,
+                transcriber.initial_prompt or None,
+                interval=cfg["transcription"].getfloat("live_interval", 1.4),
+                on_words=emit,
+            )
+            stream_holder["st"].start()
         recorder.start()
 
     def finish():
@@ -258,19 +297,31 @@ def run_listener(cfg: configparser.ConfigParser) -> None:
                 return
             state["recording"] = False
             state["busy"] = True
+        if live:
+            st = stream_holder["st"]
+            recorder.stop()
+            try:
+                text = st.finish() if st else ""
+                print(f"  live: {len(text.split())} words")
+            finally:
+                stream_holder["st"] = None
+                with lock:
+                    state["busy"] = False
+            return
+
         print("… transcribing")
         try:
             audio = recorder.stop()
             if audio is None or len(audio) < 1600:      # under ~0.1s of audio
                 print("  (too short, ignored)")
                 return
-            t0 = time.time()
+            t0 = time.monotonic()
             text = transcriber.transcribe(audio)
-            took = time.time() - t0
+            took = time.monotonic() - t0
             secs = len(audio) / recorder.sample_rate
             speed = f"{secs / took:.1f}x realtime" if took else "instant"
             print(f"  transcribed {secs:.1f}s of audio in {took:.1f}s ({speed})")
-            text = clean_with_ollama(text, cfg)
+            text = clean_text(text, cfg)
             emit(text, cfg)
         finally:
             with lock:
@@ -309,7 +360,7 @@ def run_once(cfg: configparser.ConfigParser) -> None:
         sys.exit("No audio captured.")
     text = transcriber.transcribe(audio)
     print(f"\nRaw:     {text}")
-    cleaned = clean_with_ollama(text, cfg)
+    cleaned = clean_text(text, cfg)
     if cleaned != text:
         print(f"Cleaned: {cleaned}")
 
@@ -348,21 +399,16 @@ def run_check(cfg: configparser.ConfigParser) -> None:
     print(f"hotkey           {cfg['hotkey'].get('key')} ({cfg['hotkey'].get('mode')})")
     print(f"model            {cfg['transcription'].get('model')}")
 
+    for label, value, _ok in cleanup_mod.describe():
+        print(f"  {label:<26} {value}")
     if cfg["cleanup"].getboolean("enabled", False):
-        import requests
-
-        endpoint = cfg["cleanup"].get("endpoint").rstrip("/")
-        try:
-            tags = requests.get(f"{endpoint}/api/tags", timeout=5).json()
-            names = [m["name"] for m in tags.get("models", [])]
-            wanted = cfg["cleanup"].get("model")
-            mark = "ok" if any(n.startswith(wanted.split(":")[0]) for n in names) else "NOT PULLED"
-            print(f"ollama           reachable, {len(names)} models, '{wanted}' {mark}")
-        except Exception as exc:                  # noqa: BLE001
-            print(f"ollama           UNREACHABLE ({exc})")
+        engine = cleanup_mod.resolve(cfg["cleanup"].get("engine", "auto"))
+        print(f"cleanup          on, engine = {engine}")
+        if engine == "none":
+            print("                 no engine available")
             ok = False
     else:
-        print("cleanup          disabled")
+        print("cleanup          off")
 
     print("\n" + ("All good." if ok else "Problems found — see docs/TROUBLESHOOTING.md"))
     sys.exit(0 if ok else 1)

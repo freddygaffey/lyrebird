@@ -112,17 +112,17 @@ def run(combo: dict, audio: np.ndarray, duration: float,
         prompt: str, reference: str) -> dict:
     result = dict(combo)
     try:
-        t0 = time.time()
+        t0 = time.monotonic()
         engine = backends.build(combo["backend"], combo["model"],
                                 device=combo["device"] if combo["device"] != "-" else "auto",
                                 compute_type=combo["compute_type"] if combo["compute_type"] != "-" else "auto",
                                 cpu_threads=combo["cpu_threads"])
         engine.warm()
-        result["load_s"] = round(time.time() - t0, 1)
+        result["load_s"] = round(time.monotonic() - t0, 1)
 
-        t1 = time.time()
+        t1 = time.monotonic()
         text = engine.transcribe(audio, "en", prompt or None)
-        elapsed = max(time.time() - t1, 1e-6)
+        elapsed = max(time.monotonic() - t1, 1e-6)
 
         result["run_s"] = round(elapsed, 2)
         result["speed"] = round(duration / elapsed, 1)

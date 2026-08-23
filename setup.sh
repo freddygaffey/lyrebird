@@ -54,11 +54,23 @@ if [ "$PLATFORM" = macos ]; then
     brew install portaudio || die "portaudio install failed"
   fi
 else
-  if command -v apt-get >/dev/null 2>&1; then
+  # Check before installing: on a shared or locked-down box we may have no sudo,
+  # and that must not stop the rest of the setup.
+  need_pkgs=0
+  python3 -c "import venv" 2>/dev/null || need_pkgs=1
+  ls /usr/include/portaudio.h >/dev/null 2>&1 || ls /usr/include/*/portaudio.h >/dev/null 2>&1 || need_pkgs=1
+
+  if [ "$need_pkgs" -eq 0 ]; then
+    ok "system packages already present"
+  elif ! sudo -n true 2>/dev/null; then
+    warn "no passwordless sudo - skipping system packages"
+    warn "if the build fails, install these yourself:"
+    warn "  python3-venv python3-dev portaudio19-dev xclip"
+  elif command -v apt-get >/dev/null 2>&1; then
     say "Installing system packages (apt)"
     sudo apt-get update -qq
     sudo apt-get install -y python3-venv python3-dev portaudio19-dev xclip \
-      || die "apt install failed"
+      || warn "apt install failed - continuing"
   elif command -v dnf >/dev/null 2>&1; then
     say "Installing system packages (dnf)"
     sudo dnf install -y python3-devel portaudio-devel xclip || die "dnf install failed"

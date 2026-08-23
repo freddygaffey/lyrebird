@@ -12,6 +12,7 @@ the background. No terminal, no command line.
 from __future__ import annotations
 
 import argparse
+import multiprocessing
 import socket
 import sys
 import threading
@@ -34,8 +35,8 @@ def free_port() -> int:
 
 
 def wait_for_server(port: int, timeout: float = 20.0) -> bool:
-    deadline = time.time() + timeout
-    while time.time() < deadline:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
         try:
             with socket.create_connection(("127.0.0.1", port), timeout=0.4):
                 return True
@@ -77,7 +78,9 @@ def main() -> None:
                     help="open in the default browser instead of a native window")
     ap.add_argument("--no-dictation", action="store_true",
                     help="settings only; do not start the hotkey listener")
-    args = ap.parse_args()
+    # Ignore anything we do not recognise: a frozen app can be re-launched by the
+    # OS or a child process with extra argv, and a hard argparse exit would kill it.
+    args, _unknown = ap.parse_known_args()
 
     paths.ensure_user_config()
     port = free_port()
@@ -110,4 +113,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    # Without this, PyInstaller re-executes this entry point in every child
+    # process a library spawns, and the app restarts itself in a loop.
+    multiprocessing.freeze_support()
     main()
