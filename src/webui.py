@@ -12,22 +12,39 @@ from __future__ import annotations
 
 import argparse
 import configparser
+import json
 import shutil
 import sys
+import threading
+import time
 from datetime import datetime
 from pathlib import Path
 
-from flask import Flask, redirect, render_template_string, request, url_for
+from flask import Flask, jsonify, redirect, render_template_string, request, url_for
 
 ROOT = Path(__file__).resolve().parent.parent
-CONFIG = ROOT / "config" / "config.ini"
-DICTIONARY = ROOT / "config" / "dictionary.txt"
-BACKUPS = ROOT / "config" / "backups"
+sys.path.insert(0, str(ROOT / "src"))
+
+import backends  # noqa: E402
+import paths  # noqa: E402
+paths.ensure_user_config()
+CONFIG = paths.config_dir() / "config.ini"
+DICTIONARY = paths.config_dir() / "dictionary.txt"
+BACKUPS = paths.config_dir() / "backups"
 
 app = Flask(__name__)
 
 MODELS = ["tiny", "base", "small", "medium", "large-v3", "large-v3-turbo", "distil-large-v3"]
 KEYS = ["f5", "f6", "f7", "f8", "f13", "f14", "cmd_r", "alt_r", "ctrl_r"]
+BACKENDS = [("auto", "Automatic - pick the fastest available"),
+            ("mlx", "Apple GPU (Metal) - fastest on a Mac"),
+            ("ctranslate2", "CPU / NVIDIA GPU - works everywhere")]
+DEVICES = [("auto", "Automatic"), ("cpu", "CPU"), ("cuda", "NVIDIA GPU (CUDA)")]
+COMPUTES = [("auto", "Automatic"), ("float32", "float32 - fastest on Apple Silicon"),
+            ("float16", "float16 - for NVIDIA GPUs"), ("int8", "int8 - lowest memory")]
+
+# Benchmark runs in a worker thread; the page polls /benchmark/status.
+BENCH = {"running": False, "done": False, "rows": [], "error": None, "started": 0.0}
 
 
 def read_config() -> configparser.ConfigParser:
@@ -70,6 +87,12 @@ def diagnostics() -> list[tuple[str, str, bool]]:
         rows.append(("Microphone", sd.query_devices(kind="input")["name"], True))
     except Exception as exc:
         rows.append(("Microphone", f"unavailable ({exc.__class__.__name__})", False))
+
+    for label, value, healthy in backends.describe_hardware():
+        rows.append((label, value, healthy))
+    rows.append(("Active engine",
+                 backends.resolve_backend(read_config()["transcription"].get("backend", "auto")),
+                 True))
 
     cfg = read_config()
     if cfg.has_section("cleanup") and cfg["cleanup"].getboolean("enabled", False):
@@ -120,6 +143,15 @@ TEMPLATE = """
         padding:.7rem 1.4rem;font:inherit;font-weight:600;cursor:pointer}
  .saved{background:#1a7f37;color:#fff;padding:.7rem 1rem;border-radius:8px;margin-bottom:1.25rem}
  code{background:var(--bg);border:1px solid var(--line);padding:.1rem .35rem;border-radius:4px;font-size:.85em}
+ button.ghost{background:transparent;color:var(--acc);border:1px solid var(--acc)}
+ button:disabled{opacity:.5;cursor:default}
+ .bench{margin-top:1rem;font-size:.88rem}
+ .bench th{text-align:left;color:var(--mut);font-weight:600;border-bottom:1px solid var(--line);padding:.35rem 0}
+ .bench td{padding:.35rem .5rem .35rem 0}
+ .win{font-weight:700;color:#1a7f37}
+ .spin{display:inline-block;width:.8em;height:.8em;border:2px solid var(--line);
+       border-top-color:var(--acc);border-radius:50%;animation:sp .7s linear infinite;vertical-align:-1px}
+ @keyframes sp{to{transform:rotate(360deg)}}
 </style>
 <div class="wrap">
 <h1>Dictation Settings</h1>
@@ -153,6 +185,35 @@ TEMPLATE = """
 </div>
 
 <div class="card">
+  <h2>Engine</h2>
+  <p class="hint">Which hardware does the work. <b>Automatic</b> is right for almost everyone &mdash; on this Mac it selects the Apple GPU, which measured about 6&times; faster than the CPU.</p>
+  <label>Engine<select name="backend">
+    {% for v,d in bkends %}<option value="{{v}}" {{ 'selected' if cfg['transcription'].get('backend','auto')==v }}>{{d}}</option>{% endfor %}
+  </select></label>
+  <div class="row">
+    <div><label>Processor <span class="fh">CPU/NVIDIA engine only</span><select name="device">
+      {% for v,d in devs %}<option value="{{v}}" {{ 'selected' if cfg['transcription'].get('device','auto')==v }}>{{d}}</option>{% endfor %}
+    </select></label></div>
+    <div><label>Precision <span class="fh">CPU/NVIDIA engine only</span><select name="compute_type">
+      {% for v,d in comps %}<option value="{{v}}" {{ 'selected' if cfg['transcription'].get('compute_type','auto')==v }}>{{d}}</option>{% endfor %}
+    </select></label></div>
+    <div><label>CPU threads <span class="fh">0 = automatic</span>
+      <input type="number" name="cpu_threads" min="0" max="64" value="{{ cfg['transcription'].get('cpu_threads','0') }}"></label></div>
+  </div>
+</div>
+
+<div class="card">
+  <h2>Find the best settings automatically</h2>
+  <p class="hint">Tries every engine and model available on this computer and measures both <b>speed</b> and <b>mistakes</b>. The fastest option is not always the best, so results are ranked by accuracy first. First run downloads models and can take several minutes.</p>
+  <div style="display:flex;gap:.75rem;align-items:center;flex-wrap:wrap">
+    <button type="button" id="benchBtn" onclick="startBench(false)">Run benchmark</button>
+    <button type="button" class="ghost" onclick="startBench(true)">Quick benchmark</button>
+    <span id="benchMsg" class="hint" style="margin:0"></span>
+  </div>
+  <div id="benchOut"></div>
+</div>
+
+<div class="card">
   <h2>Accuracy</h2>
   <p class="hint">Bigger models are more accurate but slower. <code>large-v3-turbo</code> is the best balance on an Apple Silicon Mac.</p>
   <label>Speech model<select name="model">
@@ -178,10 +239,16 @@ TEMPLATE = """
 
 <div class="card">
   <h2>Where the text goes</h2>
-  <label>Method<select name="output_method">
-    <option value="type" {{ 'selected' if cfg['output']['method']=='type' }}>Type it out (works everywhere)</option>
-    <option value="clipboard" {{ 'selected' if cfg['output']['method']=='clipboard' }}>Paste it (faster for long text)</option>
-  </select></label>
+  <div class="row">
+    <div><label>Method<select name="output_method">
+      <option value="type" {{ 'selected' if cfg['output']['method']=='type' }}>Type it out (works everywhere)</option>
+      <option value="clipboard" {{ 'selected' if cfg['output']['method']=='clipboard' }}>Paste it (faster for long text)</option>
+    </select></label></div>
+    <div><label>Pause before typing <span class="fh">seconds, to refocus a window</span>
+      <input type="number" step="0.05" min="0" max="5" name="delay_before_type" value="{{ cfg['output'].get('delay_before_type','0.15') }}"></label></div>
+    <div><label>Max recording <span class="fh">seconds, safety net</span>
+      <input type="number" min="10" max="3600" name="max_seconds" value="{{ cfg['audio'].get('max_seconds','300') }}"></label></div>
+  </div>
 </div>
 
 <div class="card">
@@ -193,7 +260,90 @@ TEMPLATE = """
 <button type="submit">Save settings</button>
 </form>
 </div>
+<script>
+function startBench(quick){
+  document.getElementById('benchBtn').disabled = true;
+  document.getElementById('benchMsg').innerHTML = '<span class="spin"></span> running — this can take several minutes';
+  fetch('/benchmark/start?quick=' + (quick?1:0), {method:'POST'}).then(poll);
+}
+function poll(){
+  setTimeout(function(){
+    fetch('/benchmark/status').then(r=>r.json()).then(function(s){
+      if(s.running){ poll(); return; }
+      document.getElementById('benchBtn').disabled = false;
+      if(s.error){ document.getElementById('benchMsg').textContent = 'Failed: ' + s.error; return; }
+      document.getElementById('benchMsg').textContent = 'Done. Ranked by accuracy, then speed.';
+      var h = '<table class="bench"><tr><th>Engine</th><th>Model</th><th>Speed</th><th>Mistakes</th><th></th></tr>';
+      s.rows.forEach(function(r,i){
+        h += '<tr class="'+(i===0?'win':'')+'"><td>'+r.backend+'</td><td>'+r.model+'</td>'
+           + '<td>'+(r.ok? r.speed+'x realtime':'failed')+'</td>'
+           + '<td>'+(r.ok? r.wer+'%':'-')+'</td>'
+           + '<td>'+(i===0?'best':'')+'</td></tr>';
+      });
+      h += '</table><p class="hint" style="margin-top:.75rem">'
+         + '<button type="button" onclick="applyBest()">Use the best settings</button></p>';
+      document.getElementById('benchOut').innerHTML = h;
+    });
+  }, 1500);
+}
+function applyBest(){
+  fetch('/benchmark/apply', {method:'POST'}).then(()=>location.href='/?saved=1');
+}
+</script>
 """
+
+
+def _run_benchmark(quick: bool) -> None:
+    import subprocess
+
+    BENCH.update(running=True, done=False, rows=[], error=None, started=time.time())
+    try:
+        cmd = [sys.executable, str(ROOT / "src" / "benchmark.py"), "--json"]
+        if quick:
+            cmd.append("--quick")
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+        if out.returncode != 0:
+            raise RuntimeError(out.stderr.strip().splitlines()[-1] if out.stderr else "benchmark failed")
+        payload = out.stdout[out.stdout.index("["):]
+        BENCH["rows"] = json.loads(payload)
+        BENCH["done"] = True
+    except Exception as exc:                      # noqa: BLE001
+        BENCH["error"] = f"{type(exc).__name__}: {exc}"
+    finally:
+        BENCH["running"] = False
+
+
+@app.post("/benchmark/start")
+def benchmark_start():
+    if not BENCH["running"]:
+        threading.Thread(target=_run_benchmark,
+                         args=(request.args.get("quick") == "1",), daemon=True).start()
+    return jsonify(ok=True)
+
+
+@app.get("/benchmark/status")
+def benchmark_status():
+    return jsonify(running=BENCH["running"], done=BENCH["done"],
+                   rows=BENCH["rows"], error=BENCH["error"])
+
+
+@app.post("/benchmark/apply")
+def benchmark_apply():
+    rows = [r for r in BENCH["rows"] if r.get("ok")]
+    if not rows:
+        return jsonify(ok=False, error="no successful results"), 400
+    best = rows[0]
+    backup_config()
+    cfg = read_config()
+    cfg["transcription"]["backend"] = best["backend"]
+    cfg["transcription"]["model"] = best["model"]
+    if best.get("device") not in (None, "-"):
+        cfg["transcription"]["device"] = best["device"]
+    if best.get("compute_type") not in (None, "-"):
+        cfg["transcription"]["compute_type"] = best["compute_type"]
+    with CONFIG.open("w", encoding="utf-8") as fh:
+        cfg.write(fh)
+    return jsonify(ok=True)
 
 
 @app.get("/")
@@ -205,6 +355,9 @@ def index():
         diags=diagnostics(),
         models=MODELS,
         keys=KEYS,
+        bkends=BACKENDS,
+        devs=DEVICES,
+        comps=COMPUTES,
         saved=request.args.get("saved") == "1",
     )
 
@@ -220,6 +373,12 @@ def save():
     cfg["transcription"]["model"] = f.get("model", "large-v3-turbo")
     cfg["transcription"]["language"] = f.get("language", "en").strip() or "en"
     cfg["transcription"]["use_dictionary"] = str("use_dictionary" in f).lower()
+    cfg["transcription"]["backend"] = f.get("backend", "auto")
+    cfg["transcription"]["device"] = f.get("device", "auto")
+    cfg["transcription"]["compute_type"] = f.get("compute_type", "auto")
+    cfg["transcription"]["cpu_threads"] = f.get("cpu_threads", "0").strip() or "0"
+    cfg["output"]["delay_before_type"] = f.get("delay_before_type", "0.15").strip() or "0.15"
+    cfg["audio"]["max_seconds"] = f.get("max_seconds", "300").strip() or "300"
     cfg["cleanup"]["enabled"] = str("cleanup_enabled" in f).lower()
     cfg["cleanup"]["model"] = f.get("cleanup_model", "llama3.1:8b").strip()
     cfg["output"]["method"] = f.get("output_method", "type")

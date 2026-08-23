@@ -1,4 +1,10 @@
-# local-dictation
+# Lyrebird
+
+**Offline dictation that gets your words right.**
+
+Named after the Australian bird that reproduces any sound it hears with uncanny
+precision — which is the whole job.
+
 
 Offline speech-to-text with optional local grammar cleanup. No cloud, no subscription,
 no audio or text ever leaves the machine.
@@ -21,12 +27,26 @@ fixes most of that class of error before it reaches the page.
 Everything runs on your machine. Ollama is optional — turn it off and you get raw
 Whisper output, which is already well punctuated and noticeably faster.
 
-## Quick start
+## Install (no terminal required)
+
+Download `Lyrebird.dmg`, drag Lyrebird to Applications, open it.
+
+macOS will ask for **Microphone** and **Accessibility** permission. Both are
+required: microphone to hear you, accessibility to type for you. The settings
+window opens by itself. Press **F5** to dictate.
+
+First launch downloads the speech model (about 1.6 GB). After that it is fully
+offline. On an unsigned build macOS may say the developer cannot be verified —
+right-click the app and choose **Open**.
+
+Windows: run `Lyrebird-Setup.exe`. Linux: build from source, below.
+
+## Build it yourself
 
 One script does everything, on macOS and Linux alike:
 
 ```bash
-cd ~/dev/local-dictation
+cd ~/dev/lyrebird
 ./setup.sh                # install + self-test
 ./setup.sh --cleanup      # also install Ollama for grammar cleanup
 ./setup.sh --check        # verify an existing install
@@ -53,6 +73,16 @@ Opens a plain settings page in your browser: hotkey, accuracy, grammar cleanup,
 and your word list, with a live health check at the top. It writes the same config
 files, and backs them up before every save. Nothing is exposed to the network —
 it binds to `127.0.0.1` only.
+
+## Building the installers
+
+```bash
+./build/build-macos.sh                  # -> dist/Lyrebird.app and dist/Lyrebird.dmg
+powershell -File build\build-windows.ps1  # -> dist/Lyrebird.exe (+ installer)
+```
+
+The bundle is ~118 MB. `torch` is a declared dependency of `mlx-whisper` but is
+never used at runtime, so it is excluded — that alone saves 511 MB.
 
 ## Platform support
 

@@ -6,3 +6,8 @@ models/
 *.log
 .DS_Store
 config/config.local.ini
+dist/
+build/work/
+build/installer.iss
+*.dmg
+config/benchmark-results.json

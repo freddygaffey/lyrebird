@@ -22,38 +22,35 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-CONFIG_DIR = ROOT / "config"
+CONFIG_DIR = ROOT / "config"  # replaced at runtime by paths.config_dir()
+sys.path.insert(0, str(ROOT / "src"))
+
+import backends  # noqa: E402  (needs sys.path set above)
+import paths  # noqa: E402
 
 
 # --------------------------------------------------------------------------- config
 def load_config() -> configparser.ConfigParser:
     """Load config.ini, then overlay config.local.ini if present (gitignored)."""
     cfg = configparser.ConfigParser()
-    base = CONFIG_DIR / "config.ini"
+    paths.ensure_user_config()
+    base = paths.config_dir() / "config.ini"
     if not base.exists():
         sys.exit(f"Missing config file: {base}")
     cfg.read(base)
-    local = CONFIG_DIR / "config.local.ini"
+    local = paths.config_dir() / "config.local.ini"
     if local.exists():
         cfg.read(local)
     return cfg
 
 
 def load_dictionary() -> str:
-    """Return dictionary terms as a comma-separated prompt for Whisper.
+    """Dictionary terms as a comma-separated Whisper `initial_prompt`.
 
-    Whisper accepts an `initial_prompt` that biases decoding towards the words it
-    contains. This is the cheapest, most effective accuracy win available.
+    Whisper has no formal custom-vocabulary API; the initial prompt biases decoding
+    towards the words it contains. Cheapest, most effective accuracy win available.
     """
-    path = CONFIG_DIR / "dictionary.txt"
-    if not path.exists():
-        return ""
-    terms = [
-        line.strip()
-        for line in path.read_text(encoding="utf-8").splitlines()
-        if line.strip() and not line.startswith("#")
-    ]
-    return ", ".join(terms)
+    return backends.load_dictionary()
 
 
 # --------------------------------------------------------------------------- audio
@@ -108,30 +105,28 @@ class Recorder:
 
 # --------------------------------------------------------------------- transcription
 class Transcriber:
-    """Wraps faster-whisper. The model is loaded once and reused."""
+    """Loads the configured backend once and reuses it."""
 
     def __init__(self, cfg: configparser.ConfigParser):
-        from faster_whisper import WhisperModel
-
         section = cfg["transcription"]
-        model_name = section.get("model", "large-v3-turbo")
-        device = section.get("device", "auto")
-        compute = section.get("compute_type", "auto")
+        model = section.get("model", "large-v3-turbo")
+        requested = section.get("backend", "auto")
+        resolved = backends.resolve_backend(requested)
 
-        threads = section.getint("cpu_threads", 0)
-
-        if device == "auto":
-            device = "cpu"          # CTranslate2 has no Metal backend; CPU is correct on Mac
-        if compute == "auto":
-            # float32 measured faster than int8 on Apple Silicon - see config.ini
-            compute = "float32" if sys.platform == "darwin" else "int8"
-
-        print(f"Loading model '{model_name}' "
-              f"(device={device}, compute={compute}, threads={threads or 'auto'})...")
+        print(f"Loading '{model}' on {resolved} backend"
+              f"{'' if requested == resolved else f' (auto-selected from {requested})'}...")
         t0 = time.time()
-        self.model = WhisperModel(
-            model_name, device=device, compute_type=compute, cpu_threads=threads
+        self.backend = backends.build(
+            requested,
+            model,
+            device=section.get("device", "auto"),
+            compute_type=section.get("compute_type", "auto"),
+            cpu_threads=section.getint("cpu_threads", 0),
         )
+        try:
+            self.backend.warm()
+        except Exception as exc:            # noqa: BLE001 - warming is best-effort
+            print(f"  (warm-up skipped: {exc})", file=sys.stderr)
         print(f"Model ready in {time.time() - t0:.1f}s")
 
         self.language = section.get("language", "en")
@@ -140,13 +135,7 @@ class Transcriber:
         )
 
     def transcribe(self, audio) -> str:
-        kwargs = {"beam_size": 5}
-        if self.language and self.language != "auto":
-            kwargs["language"] = self.language
-        if self.initial_prompt:
-            kwargs["initial_prompt"] = self.initial_prompt
-        segments, _info = self.model.transcribe(audio, **kwargs)
-        return " ".join(seg.text.strip() for seg in segments).strip()
+        return self.backend.transcribe(audio, self.language, self.initial_prompt or None)
 
 
 # -------------------------------------------------------------------------- cleanup
@@ -350,6 +339,11 @@ def run_check(cfg: configparser.ConfigParser) -> None:
         ok = False
 
     terms = load_dictionary()
+    print()
+    for label, value, _ok in backends.describe_hardware():
+        print(f"  {label:<18} {value}")
+    print(f"\nbackend          {backends.resolve_backend(cfg['transcription'].get('backend','auto'))}"
+          f"  (config: {cfg['transcription'].get('backend','auto')})")
     print(f"dictionary       {len(terms.split(',')) if terms else 0} terms")
     print(f"hotkey           {cfg['hotkey'].get('key')} ({cfg['hotkey'].get('mode')})")
     print(f"model            {cfg['transcription'].get('model')}")
