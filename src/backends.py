@@ -52,10 +52,16 @@ def _register_windows_cuda_dlls() -> None:
             if not nvidia.is_dir():
                 continue
             for binary_dir in nvidia.glob("*/bin"):
+                path = str(binary_dir)
+                # Two mechanisms, because they cover different loaders:
+                # add_dll_directory serves Python's own extension loading, while
+                # ctranslate2 calls LoadLibrary internally, which searches PATH.
                 try:
-                    os.add_dll_directory(str(binary_dir))
+                    os.add_dll_directory(path)
                 except (OSError, AttributeError):
                     pass
+                if path not in os.environ.get("PATH", ""):
+                    os.environ["PATH"] = path + os.pathsep + os.environ.get("PATH", "")
     except Exception:                              # noqa: BLE001 - best effort
         pass
 
