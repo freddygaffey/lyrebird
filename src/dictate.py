@@ -344,6 +344,86 @@ def run_listener(cfg: configparser.ConfigParser) -> None:
         listener.join()
 
 
+def run_live_test(cfg: configparser.ConfigParser) -> None:
+    """Stream from the microphone and print words as they are recognised.
+
+    Needs microphone access only - no Accessibility permission, no hotkey, and
+    nothing is typed into other applications. This isolates "does streaming
+    work" from "is the app allowed to type", which fail for different reasons.
+    """
+    import sounddevice as sd
+
+    audio_cfg = cfg["audio"]
+
+    dev = sd.query_devices(kind="input")
+    print(f"\nInput device : {dev['name']}")
+    print(f"Sample rate  : {audio_cfg.getint('sample_rate', 16000)} Hz, "
+          f"{audio_cfg.getint('channels', 1)} channel(s)")
+
+    transcriber = Transcriber(cfg)
+
+    recorder = Recorder(
+        audio_cfg.getint("sample_rate", 16000),
+        audio_cfg.getint("channels", 1),
+        audio_cfg.getint("max_seconds", 300),
+    )
+    st = streaming_mod.StreamingTranscriber(
+        transcriber.backend,
+        transcriber.language,
+        transcriber.initial_prompt or None,
+        interval=cfg["transcription"].getfloat("live_interval", 1.4),
+        on_words=lambda ws: (sys.stdout.write(("\r\033[K" if sys.stdout.isatty() else "")
+                                              + " ".join(ws) + "\n"),
+                             sys.stdout.flush()),
+    )
+
+    stats = {"peak": 0.0, "chunks": 0, "samples": 0}
+    # Only draw the meter to a real terminal. Piped or redirected, the escape
+    # codes become unreadable noise.
+    interactive = sys.stdout.isatty()
+
+    def tap(chunk):
+        stats["chunks"] += 1
+        stats["samples"] += len(chunk)
+        p = float(abs(chunk).max()) if len(chunk) else 0.0
+        stats["peak"] = max(stats["peak"], p)
+        # Live meter, so it is obvious whether audio is arriving at all.
+        if interactive:
+            bars = int(min(p, 0.5) / 0.5 * 30)
+            sys.stdout.write("\r\033[K  mic |" + "#" * bars + "-" * (30 - bars) +
+                             f"| {p:.3f}")
+            sys.stdout.flush()
+        st.add_audio(chunk)
+
+    recorder.on_chunk = tap
+
+    print("\nSpeak now - the meter below should move while you talk.")
+    print("Press Enter when you have finished.\n")
+    st.start()
+    recorder.start()
+    try:
+        input()
+    except (EOFError, KeyboardInterrupt):
+        pass
+    recorder.stop()
+    final = st.finish()
+
+    print(("\r\033[K" if interactive else "") + "-" * 60)
+    print(f"Final text   : {final or '(nothing recognised)'}")
+    print(f"Audio chunks : {stats['chunks']}  "
+          f"({stats['samples'] / max(audio_cfg.getint('sample_rate', 16000), 1):.1f}s captured)")
+    print(f"Mic peak     : {stats['peak']:.4f}", end="")
+    if stats["chunks"] == 0:
+        print("   <-- the audio callback never fired: capture never started")
+    elif stats["peak"] < 0.001:
+        print("   <-- callback fired but every sample was zero:")
+        print("                    microphone access denied, or the device is muted")
+    elif stats["peak"] < 0.02:
+        print("   <-- very quiet")
+    else:
+        print("   (healthy)")
+
+
 def run_once(cfg: configparser.ConfigParser) -> None:
     audio_cfg = cfg["audio"]
     recorder = Recorder(
@@ -419,6 +499,8 @@ def main() -> None:
     parser.add_argument("--check", action="store_true", help="diagnose the install")
     parser.add_argument("--once", action="store_true", help="record one utterance and print")
     parser.add_argument("--devices", action="store_true", help="list audio input devices")
+    parser.add_argument("--live", action="store_true",
+                        help="stream from the mic and print words; no typing, no permissions needed")
     args = parser.parse_args()
 
     cfg = load_config()
@@ -430,6 +512,10 @@ def main() -> None:
         return
     if args.check:
         run_check(cfg)
+        return
+    if args.live:
+        cfg["transcription"]["live"] = "true"
+        run_live_test(cfg)
         return
     if args.once:
         run_once(cfg)

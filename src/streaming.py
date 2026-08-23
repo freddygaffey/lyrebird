@@ -24,9 +24,38 @@ import numpy as np
 
 SAMPLE_RATE = 16000
 
+# Whisper invents text when fed silence or room tone - "and the", "...", "Thank
+# you.", "you". In live mode that means words appearing in your document every
+# time you pause, so silence is gated out before it ever reaches the model.
+SILENCE_RMS = 0.006
+
+# Phrases Whisper commonly emits for non-speech audio. Matched on a whole pass,
+# never on a substring, so genuine uses of these words survive.
+HALLUCINATIONS = {
+    "you", "thank you.", "thank you", "thanks for watching!", "bye.", "bye",
+    ".", "...", "the", "and the", "so", "okay.", "oh.", "yeah.", "hmm.",
+    "subtitles by the amara.org community", "please subscribe!",
+}
+
 
 def _words(text: str) -> list[str]:
     return text.split()
+
+
+def _is_hallucination(text: str) -> bool:
+    stripped = text.strip().lower()
+    if not stripped:
+        return True
+    if stripped in HALLUCINATIONS:
+        return True
+    # Nothing but dots, commas and spaces carries no information.
+    return not any(c.isalnum() for c in stripped)
+
+
+def _rms(audio: np.ndarray) -> float:
+    if audio.size == 0:
+        return 0.0
+    return float(np.sqrt(np.mean(np.square(audio))))
 
 
 def _common_prefix(a: list[str], b: list[str]) -> int:
@@ -94,7 +123,15 @@ class StreamingTranscriber:
         if len(audio) < SAMPLE_RATE * 0.4:        # under 0.4s is not worth a pass
             return
 
+        # Gate on loudness before spending a transcription pass. This is both a
+        # correctness fix (no invented words) and a large saving in compute,
+        # since most of a dictation session is pauses.
+        if _rms(audio) < SILENCE_RMS:
+            return
+
         text = self.backend.transcribe(audio, self.language, self.initial_prompt)
+        if _is_hallucination(text):
+            return
         words = _words(text)
         if not words:
             return
